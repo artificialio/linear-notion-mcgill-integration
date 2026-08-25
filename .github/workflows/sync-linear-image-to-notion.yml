@@ -1,0 +1,38 @@
+name: Sync Linear image to Notion
+
+# Manually triggered (or triggered remotely via the GitHub connector's
+# workflow-dispatch tool from the "EXPERIMENT: Notion image upload test" Linear Loop).
+#
+# This exists because a Linear Loop cannot perform raw HTTP requests - it can only
+# call structured MCP connector actions. That blocks (a) an authenticated download
+# of the screenshot bytes from Linear, and (b) the raw multipart POST that Notion's
+# upload flow requires. This workflow runs a real script with a real HTTP client that
+# does both directly, then reports the outcome back onto the Linear issue.
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_identifier:
+        description: 'Linear issue identifier, e.g. MCG-147'
+        required: true
+        default: 'MCG-147'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run image sync
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
+        run: node scripts/sync-image-to-notion.mjs
