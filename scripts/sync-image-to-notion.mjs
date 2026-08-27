@@ -10,6 +10,25 @@
  *   (b) the raw multipart POST that Notion's upload flow requires
  * This script has a real HTTP client (Node's built-in fetch) and does both directly.
  *
+ * Page formatting mirrors Elizabeth's reformatted example doc ("Test Evidence Doc
+ * example" in Notion), compared against the production Loop's older plain-text
+ * template:
+ *   - Summary is a callout block (Ticket / Overall status / Environment / Product
+ *     / Iteration/Sprint), with Overall status in colour+bold.
+ *   - AC Outcomes table has only AC # / Description / Outcome columns (no Evidence
+ *     column) - Outcome is colour+bold: green=Pass, red=Fail, yellow=Partial.
+ *   - Evidence Log has a Date / Tester name table, then one block per AC with bold
+ *     "Outcome:", bold "Record:" (omitted entirely when Environment is DEV - the
+ *     QA team reading this doc has no DEV access), a bold "Evidence" subheading,
+ *     and a divider between each AC's block.
+ *   - Anywhere Pass/Fail/Partial appears as a test outcome, it gets the same
+ *     colour+bold treatment.
+ *
+ * NOTE on table/column width: the Notion public API does not expose column widths
+ * or the page "full width" toggle - those are client-only settings with no API
+ * surface, so the "wider, A4-like tables with a wide Description column" request
+ * can't be automated here. That still needs a one-time manual drag in Notion.
+ *
  * Comment format this parses (mirrors the real "Sync MCG test evidence to Notion"
  * production Loop's #test-output / #regression-test-output template):
  *
@@ -54,6 +73,15 @@ const NOTION_VERSION = '2022-06-28';
 const NOTION_API = 'https://api.notion.com/v1';
 const LINEAR_API = 'https://api.linear.app/graphql';
 
+// Outcome -> Notion rich_text colour annotation. Applied everywhere an outcome
+// word is rendered: the Summary callout's Overall status, the AC Outcomes table,
+// and each AC's Outcome line in the Evidence Log.
+const OUTCOME_COLOR = {
+  Pass: 'green',
+  Fail: 'red',
+  Partial: 'yellow',
+};
+
 function assertEnv() {
   const missing = [];
   if (!LINEAR_API_KEY) missing.push('LINEAR_API_KEY');
@@ -95,7 +123,7 @@ async function getIssueWithComments(identifier) {
         title
         url
         comments(first: 100, after: $after) {
-          nodes { id url body createdAt }
+          nodes { id url body createdAt user { name } }
           pageInfo { hasNextPage endCursor }
         }
       }
@@ -151,7 +179,7 @@ function parseHeaderFields(body, endIndex) {
 }
 
 /**
- * Parse every "AC<n>: <description> / Outcome: <Pass|Fail> / Evidence: ..."
+ * Parse every "AC<n>: <description> / Outcome: <Pass|Fail|Partial> / Evidence: ..."
  * block out of a #test-output or #regression-test-output style comment body.
  * Each block runs from its "AC<n>:" header line up to (but not including) the
  * next "AC<n>:" header line, or the end of the comment - so evidence images
@@ -172,19 +200,71 @@ function parseACBlocks(body) {
     const blockEnd = i + 1 < starts.length ? starts[i + 1].index : body.length;
     const blockText = body.slice(blockStart, blockEnd);
 
-    const outcomeMatch = blockText.match(/Outcome:\s*(Pass|Fail)/i);
+    const outcomeMatch = blockText.match(/Outcome:\s*(Pass|Fail|Partial)/i);
     const evidenceMatch = blockText.match(/Evidence:\s*([\s\S]*)$/i);
     const evidenceRaw = evidenceMatch ? evidenceMatch[1] : blockText;
+
+    // Normalise casing so it matches OUTCOME_COLOR's keys (Pass/Fail/Partial).
+    const rawOutcome = outcomeMatch ? outcomeMatch[1] : null;
+    const outcome = rawOutcome
+      ? rawOutcome[0].toUpperCase() + rawOutcome.slice(1).toLowerCase()
+      : 'Not specified';
 
     acs.push({
       number: starts[i].number,
       description: starts[i].description,
-      outcome: outcomeMatch ? outcomeMatch[1] : 'Not specified',
+      outcome,
       evidenceText: evidenceRaw.replace(/!\[[^\]]*\]\([^)]+\)/g, '').trim(),
       imageUrls: extractImageUrls(evidenceRaw),
     });
   }
   return { acs, firstIndex: starts.length ? starts[0].index : body.length };
+}
+
+/**
+ * Overall ticket status from the set of AC outcomes, same rule the production
+ * Loop uses: Pass only if every AC is Pass, Fail only if every tested AC is
+ * Fail, Partial if it's a mix, Not tested if nothing was parsed as Pass/Fail.
+ */
+function calcOverallStatus(acs) {
+  const tested = acs.filter((ac) => ac.outcome === 'Pass' || ac.outcome === 'Fail' || ac.outcome === 'Partial');
+  if (tested.length === 0) return 'Not tested';
+  if (tested.every((ac) => ac.outcome === 'Pass')) return 'Pass';
+  if (tested.every((ac) => ac.outcome === 'Fail')) return 'Fail';
+  return 'Partial';
+}
+
+function formatDate(iso) {
+  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+}
+
+// --- Small rich_text builders, so every outcome word gets the same treatment
+// wherever it appears (Summary callout, AC Outcomes table, Evidence Log). ---
+
+function plainText(content) {
+  return { type: 'text', text: { content } };
+}
+
+function boldText(content) {
+  return { type: 'text', text: { content }, annotations: { bold: true } };
+}
+
+function linkText(content, url) {
+  return { type: 'text', text: { content, link: { url } } };
+}
+
+function outcomeText(outcome) {
+  const color = OUTCOME_COLOR[outcome];
+  return {
+    type: 'text',
+    text: { content: outcome },
+    annotations: color ? { bold: true, color } : { bold: true },
+  };
+}
+
+function labelValue(label, valueRuns) {
+  // "**Label:** value" as a single rich_text run array.
+  return [boldText(`${label}: `), ...(Array.isArray(valueRuns) ? valueRuns : [plainText(valueRuns)])];
 }
 
 async function downloadLinearAsset(url) {
@@ -283,59 +363,150 @@ async function appendBlocks(pageId, children) {
   });
 }
 
-async function appendRunHeading(pageId, issue, comment, header) {
-  const metaLine = [
-    header.scenario ? `Scenario: ${header.scenario}` : null,
-    header.environment ? `Environment: ${header.environment}` : null,
-    header.product ? `Product: ${header.product}` : null,
-    header.iteration ? `Iteration/Sprint: ${header.iteration}` : null,
-  ]
-    .filter(Boolean)
-    .join(' | ');
+async function appendSummaryCallout(pageId, issue, header, overallStatus) {
+  const rich_text = [
+    ...labelValue('Ticket', [linkText(`${issue.identifier} — ${issue.title}`, issue.url)]),
+    plainText('\n\n'),
+    ...labelValue('Overall status', [outcomeText(overallStatus)]),
+    plainText('\n\n'),
+    ...labelValue('Environment', header.environment || 'Not specified'),
+    plainText('\n\n'),
+    ...labelValue('Product', header.product || 'Not specified'),
+    plainText('\n\n'),
+    ...labelValue('Iteration/Sprint', header.iteration || 'Not specified'),
+  ];
 
   return appendBlocks(pageId, [
     {
       object: 'block',
       type: 'heading_2',
-      heading_2: {
-        rich_text: [{ text: { content: 'Image Upload Experiment (GitHub Actions bridge)' } }],
-      },
+      heading_2: { rich_text: [plainText('Summary')] },
     },
     {
       object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [
-          {
-            text: {
-              content: `Synced from Linear comment ${comment.id} via the GitHub Actions bridge.${
-                metaLine ? ` ${metaLine}` : ''
-              }`,
-            },
-          },
-        ],
+      type: 'callout',
+      callout: {
+        rich_text,
+        icon: { type: 'emoji', emoji: '🗂️' },
       },
     },
   ]);
 }
 
-async function appendACSection(pageId, ac) {
+async function appendACOutcomesTable(pageId, acs) {
+  const headerRow = {
+    object: 'block',
+    type: 'table_row',
+    table_row: {
+      cells: [[plainText('AC #')], [plainText('Description')], [plainText('Outcome')]],
+    },
+  };
+  const rows = acs.map((ac) => ({
+    object: 'block',
+    type: 'table_row',
+    table_row: {
+      cells: [
+        [plainText(`AC${ac.number}`)],
+        [plainText(ac.description)],
+        [outcomeText(ac.outcome)],
+      ],
+    },
+  }));
+
   return appendBlocks(pageId, [
     {
       object: 'block',
-      type: 'heading_3',
-      heading_3: {
-        rich_text: [{ text: { content: `AC${ac.number}: ${ac.description} — ${ac.outcome}` } }],
+      type: 'heading_2',
+      heading_2: { rich_text: [plainText('AC Outcomes')] },
+    },
+    {
+      object: 'block',
+      type: 'table',
+      table: {
+        table_width: 3,
+        has_column_header: true,
+        has_row_header: false,
+        children: [headerRow, ...rows],
       },
+    },
+  ]);
+}
+
+async function appendEvidenceLogHeader(pageId, comment) {
+  const headerRow = {
+    object: 'block',
+    type: 'table_row',
+    table_row: { cells: [[plainText('Date')], [plainText('Tester name')]] },
+  };
+  const dataRow = {
+    object: 'block',
+    type: 'table_row',
+    table_row: {
+      cells: [
+        [plainText(formatDate(comment.createdAt))],
+        [plainText(comment.user?.name || 'Unknown')],
+      ],
+    },
+  };
+
+  return appendBlocks(pageId, [
+    {
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [plainText('Evidence Log')] },
+    },
+    {
+      object: 'block',
+      type: 'table',
+      table: {
+        table_width: 2,
+        has_column_header: true,
+        has_row_header: false,
+        children: [headerRow, dataRow],
+      },
+    },
+  ]);
+}
+
+async function appendEvidenceLogACBlock(pageId, ac, header, isDev) {
+  const blocks = [
+    { object: 'block', type: 'divider', divider: {} },
+    {
+      object: 'block',
+      type: 'heading_3',
+      heading_3: { rich_text: [plainText(`AC${ac.number} — ${ac.description}`)] },
     },
     {
       object: 'block',
       type: 'paragraph',
-      paragraph: {
-        rich_text: [{ text: { content: ac.evidenceText ? `Evidence: ${ac.evidenceText}` : 'Evidence:' } }],
-      },
+      paragraph: { rich_text: labelValue('Outcome', [outcomeText(ac.outcome)]) },
     },
-  ]);
+  ];
+
+  // QA reads this doc without DEV access - never link to a DEV record.
+  if (header.record && !isDev) {
+    blocks.push({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: { rich_text: labelValue('Record', [linkText('Open test record', header.record)]) },
+    });
+  }
+
+  blocks.push({
+    object: 'block',
+    type: 'paragraph',
+    paragraph: { rich_text: [boldText('Evidence')] },
+  });
+
+  if (ac.evidenceText) {
+    blocks.push({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: { rich_text: [plainText(ac.evidenceText)] },
+    });
+  }
+
+  return appendBlocks(pageId, blocks);
 }
 
 async function appendImageBlock(pageId, fileUploadId) {
@@ -377,18 +548,23 @@ async function main() {
     throw new Error(`Marked comment ${comment.id} contains no AC blocks (expected "AC1: ...", "Outcome: ...", "Evidence: ...")`);
   }
   const header = parseHeaderFields(comment.body, firstIndex);
+  const isDev = (header.environment || '').trim().toUpperCase() === 'DEV';
 
   const totalImages = acs.reduce((n, ac) => n + ac.imageUrls.length, 0);
   if (totalImages === 0) {
     throw new Error(`Marked comment ${comment.id} has ${acs.length} AC block(s) but no embedded screenshots`);
   }
 
+  const overallStatus = calcOverallStatus(acs);
   const pageId = await findOrCreateNotionPage(issue);
-  await appendRunHeading(pageId, issue, comment, header);
+
+  await appendSummaryCallout(pageId, issue, header, overallStatus);
+  await appendACOutcomesTable(pageId, acs);
+  await appendEvidenceLogHeader(pageId, comment);
 
   const results = [];
   for (const ac of acs) {
-    await appendACSection(pageId, ac);
+    await appendEvidenceLogACBlock(pageId, ac, header, isDev);
     let i = 0;
     for (const url of ac.imageUrls) {
       const filename = `${issue.identifier}-${comment.id}-AC${ac.number}-${i}.png`;
@@ -404,6 +580,7 @@ async function main() {
   const summary = [
     'Image sync succeeded via the GitHub Actions bridge (this bypasses the Loop entirely).',
     `Issue: ${issue.identifier} - comment ${comment.id}`,
+    `Overall status: ${overallStatus}`,
     `AC blocks parsed: ${acs.length}`,
     `Images synced: ${results.length}`,
     ...acs.map((ac) => `  - AC${ac.number} (${ac.outcome}): ${ac.imageUrls.length} image(s)`),
