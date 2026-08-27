@@ -115,6 +115,10 @@ async function getIssueWithComments(identifier) {
       break;
     }
   }
+  // Do not trust the connection's implicit order (observed to not reliably be
+  // creation-ascending across pagination) - sort explicitly so "most recent
+  // marked comment" picks are actually correct regardless of API ordering.
+  allComments.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   return { ...issueMeta, comments: { nodes: allComments } };
 }
 
