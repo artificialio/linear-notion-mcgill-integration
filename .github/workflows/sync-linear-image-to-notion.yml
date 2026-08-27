@@ -1,7 +1,13 @@
 name: Sync Linear image to Notion
 
-# Manually triggered (or triggered remotely via the GitHub connector's
-# workflow-dispatch tool from the "EXPERIMENT: Notion image upload test" Linear Loop).
+# Triggered by a push that touches .github/triggers/**, made by the GitHub
+# connector's "Create or update file" tool from the "EXPERIMENT: Notion image
+# upload test" Linear Loop (committing a file named "<ISSUE-ID>.json").
+#
+# We use a push-triggered trigger file instead of workflow_dispatch because the
+# Linear GitHub connector's toolset has no workflow-dispatch/run-workflow action
+# at all (confirmed by inspecting its full tool list) - "Create or update file" is
+# the one write action it does have that can kick off an Actions run.
 #
 # This exists because a Linear Loop cannot perform raw HTTP requests - it can only
 # call structured MCP connector actions. That blocks (a) an authenticated download
@@ -10,12 +16,10 @@ name: Sync Linear image to Notion
 # does both directly, then reports the outcome back onto the Linear issue.
 
 on:
-  workflow_dispatch:
-    inputs:
-      issue_identifier:
-        description: 'Linear issue identifier, e.g. MCG-147'
-        required: true
-        default: 'MCG-147'
+  push:
+    branches: [main]
+    paths:
+      - '.github/triggers/**'
 
 jobs:
   sync:
@@ -23,6 +27,20 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Determine issue identifier from trigger file
+        id: trigger
+        run: |
+          CHANGED=$(git diff --name-only HEAD^ HEAD -- '.github/triggers/' | grep -v '^\.github/triggers/README' | tail -n1)
+          if [ -z "$CHANGED" ]; then
+            echo "No trigger file changed under .github/triggers/ in this push" >&2
+            exit 1
+          fi
+          ISSUE_ID=$(basename "$CHANGED" .json)
+          echo "Trigger file: $CHANGED -> issue $ISSUE_ID"
+          echo "issue_identifier=$ISSUE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -34,5 +52,5 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
+          ISSUE_IDENTIFIER: ${{ steps.trigger.outputs.issue_identifier }}
         run: node scripts/sync-image-to-notion.mjs
