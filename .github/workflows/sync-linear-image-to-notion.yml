@@ -1,8 +1,10 @@
-name: Sync Linear image to Notion
+name: Sync Linear test evidence to Notion
 
 # Triggered by a push that touches .github/triggers/**, made by the GitHub
-# connector's "Create or update file" tool from the "EXPERIMENT: Notion image
-# upload test" Linear Loop (committing a file named "<ISSUE-ID>.json").
+# connector's "Create or update file" tool from the "Sync MCG test evidence to
+# Notion" Linear Loop (committing a file named "<ISSUE-ID>.json" whenever an
+# issue moves to Passed QA and has a #test-output or #regression-test-output
+# comment).
 #
 # We use a push-triggered trigger file instead of workflow_dispatch because the
 # Linear GitHub connector's toolset has no workflow-dispatch/run-workflow action
@@ -47,10 +49,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run image sync
+      - name: Run test evidence sync
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           ISSUE_IDENTIFIER: ${{ steps.trigger.outputs.issue_identifier }}
-        run: node scripts/sync-image-to-notion.mjs
+        run: node scripts/sync-test-evidence-to-notion.mjs
