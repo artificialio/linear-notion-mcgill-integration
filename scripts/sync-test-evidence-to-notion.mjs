@@ -155,6 +155,19 @@ async function getIssueWithComments(identifier) {
   return { ...issueMeta, comments: { nodes: allComments } };
 }
 
+// Linear silently rewrites a bare URL pasted into a comment into markdown
+// link syntax, e.g. `[https://example.com/x](<https://example.com/x>)`. Every
+// place that reads a Record: value takes the rest of the line verbatim, so
+// without this it stores the whole `[...](...)` string as the link instead
+// of the URL - producing a broken/wrong link in Notion. QA shouldn't have to
+// remember to "paste as plain text" for this to work, so unwrap it here.
+function unwrapMarkdownLink(text) {
+  if (!text) return text;
+  const trimmed = text.trim();
+  const m = trimmed.match(/^\[[^\]]*\]\(<?([^)>\s]+)>?\)$/);
+  return m ? m[1].trim() : trimmed;
+}
+
 function extractImageUrls(text) {
   // Linear embeds pasted screenshots as markdown image syntax pointing at
   // uploads.linear.app. Authenticated download only - see downloadLinearAsset.
@@ -179,7 +192,7 @@ function parseHeaderFields(body, endIndex) {
     environment: get('Environment'),
     product: get('Product'),
     iteration: get('Iteration/Sprint'),
-    record: get('Record'),
+    record: unwrapMarkdownLink(get('Record')),
   };
 }
 
@@ -271,7 +284,7 @@ function parseACBlocks(body) {
         if (text) data.evidenceText = data.evidenceText ? `${data.evidenceText}\n\n${text}` : text;
         data.imageUrls = data.imageUrls.concat(extractImageUrls(content));
       } else if (marker.kind === 'record') {
-        const link = content.split('\n')[0].trim();
+        const link = unwrapMarkdownLink(content.split('\n')[0]);
         if (link) data.record = link;
       }
     }
