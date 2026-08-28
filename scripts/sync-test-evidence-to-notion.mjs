@@ -168,16 +168,27 @@ function unwrapMarkdownLink(text) {
   return m ? m[1].trim() : trimmed;
 }
 
-function extractImageUrls(text) {
-  // Linear embeds pasted screenshots as markdown image syntax pointing at
-  // uploads.linear.app. Authenticated download only - see downloadLinearAsset.
-  const urls = [];
+// A QA tester sometimes writes several screenshots into one Evidence block
+// with explanatory text between them, e.g. "step 1 [img] then step 2 [img]".
+// Tokenize the block into an ordered sequence of text/image segments instead
+// of bucketing all text together and all images together, so the original
+// interleaving survives into Notion instead of being silently reordered.
+function tokenizeEvidenceContent(content) {
+  const tokens = [];
   const re = /!\[[^\]]*\]\((https:\/\/uploads\.linear\.app\/[^)\s]+)\)/g;
+  let lastIndex = 0;
   let m;
-  while ((m = re.exec(text)) !== null) {
-    urls.push(m[1]);
+  while ((m = re.exec(content)) !== null) {
+    const textBefore = content.slice(lastIndex, m.index).trim();
+    if (textBefore) tokens.push({ type: 'text', text: textBefore });
+    // Linear embeds pasted screenshots as markdown image syntax pointing at
+    // uploads.linear.app. Authenticated download only - see downloadLinearAsset.
+    tokens.push({ type: 'image', url: m[1] });
+    lastIndex = re.lastIndex;
   }
-  return urls;
+  const textAfter = content.slice(lastIndex).trim();
+  if (textAfter) tokens.push({ type: 'text', text: textAfter });
+  return tokens;
 }
 
 function parseHeaderFields(body, endIndex) {
@@ -236,8 +247,7 @@ function parseACBlocks(body) {
       number: acHeaders[i].number,
       description: acHeaders[i].description,
       outcome,
-      evidenceText: '',
-      imageUrls: [],
+      evidenceSegments: [],
       record: null,
       _blockText: blockText, // kept only for the no-Evidence-marker fallback below
     });
@@ -280,9 +290,7 @@ function parseACBlocks(body) {
       const data = acData.get(num);
       if (!data) continue; // marker tags an AC number that doesn't exist in this comment
       if (marker.kind === 'evidence') {
-        const text = content.replace(/!\[[^\]]*\]\([^)]+\)/g, '').trim();
-        if (text) data.evidenceText = data.evidenceText ? `${data.evidenceText}\n\n${text}` : text;
-        data.imageUrls = data.imageUrls.concat(extractImageUrls(content));
+        data.evidenceSegments = data.evidenceSegments.concat(tokenizeEvidenceContent(content));
       } else if (marker.kind === 'record') {
         const link = unwrapMarkdownLink(content.split('\n')[0]);
         if (link) data.record = link;
@@ -293,9 +301,8 @@ function parseACBlocks(body) {
   // Backward compatibility: an AC with no Evidence marker at all falls back
   // to treating its whole header-to-next-header span as evidence.
   for (const data of acData.values()) {
-    if (!data.evidenceText && data.imageUrls.length === 0) {
-      data.evidenceText = data._blockText.replace(/!\[[^\]]*\]\([^)]+\)/g, '').trim();
-      data.imageUrls = extractImageUrls(data._blockText);
+    if (data.evidenceSegments.length === 0) {
+      data.evidenceSegments = tokenizeEvidenceContent(data._blockText);
     }
     delete data._blockText;
   }
@@ -655,14 +662,10 @@ async function appendEvidenceLogACBlock(pageId, ac, header, isDev) {
     paragraph: { rich_text: [boldText('Evidence')] },
   });
 
-  if (ac.evidenceText) {
-    blocks.push({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: { rich_text: [plainText(ac.evidenceText)] },
-    });
-  }
-
+  // Text and screenshots within this AC's Evidence block are appended
+  // separately, in original order, by appendACWithImages below - a screenshot
+  // requires an async download/upload round-trip, so it can't be built as a
+  // block literal here alongside the text.
   return appendBlocks(pageId, blocks);
 }
 
@@ -821,7 +824,18 @@ async function main() {
   async function appendACWithImages(ac, header, isDev, filenamePrefix) {
     await appendEvidenceLogACBlock(pageId, ac, header, isDev);
     let i = 0;
-    for (const url of ac.imageUrls) {
+    // Walk the Evidence block's segments in the order QA actually wrote them -
+    // text and screenshots can be interleaved (e.g. "step 1 [img] step 2
+    // [img]") and this renders that same sequence into Notion, rather than
+    // dumping all the text first and all the screenshots after.
+    for (const seg of ac.evidenceSegments) {
+      if (seg.type === 'text') {
+        await appendBlocks(pageId, [
+          { object: 'block', type: 'paragraph', paragraph: { rich_text: [plainText(seg.text)] } },
+        ]);
+        continue;
+      }
+      const url = seg.url;
       let cached = uploadCache.get(url);
       if (!cached) {
         const filename = `${filenamePrefix}-AC${ac.number}-${i}.png`;
