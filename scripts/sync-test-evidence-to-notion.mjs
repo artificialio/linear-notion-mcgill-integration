@@ -173,20 +173,30 @@ function unwrapMarkdownLink(text) {
 // Tokenize the block into an ordered sequence of text/image segments instead
 // of bucketing all text together and all images together, so the original
 // interleaving survives into Notion instead of being silently reordered.
+// Same Linear auto-linkify behavior as unwrapMarkdownLink above (a pasted
+// bare URL becomes `[url](<url>)`), but applied inline within a longer
+// stretch of evidence text rather than to a whole line - e.g. a QA tester
+// pasting a Loom link as their evidence. Only collapses the exact
+// label-equals-target shape Linear produces, so it won't touch a
+// deliberately different link label.
+function unwrapInlineMarkdownLinks(text) {
+  return text.replace(/\[(https?:\/\/[^\]\s]+)\]\(<?\1>?\)/g, '$1');
+}
+
 function tokenizeEvidenceContent(content) {
   const tokens = [];
   const re = /!\[[^\]]*\]\((https:\/\/uploads\.linear\.app\/[^)\s]+)\)/g;
   let lastIndex = 0;
   let m;
   while ((m = re.exec(content)) !== null) {
-    const textBefore = content.slice(lastIndex, m.index).trim();
+    const textBefore = unwrapInlineMarkdownLinks(content.slice(lastIndex, m.index).trim());
     if (textBefore) tokens.push({ type: 'text', text: textBefore });
     // Linear embeds pasted screenshots as markdown image syntax pointing at
     // uploads.linear.app. Authenticated download only - see downloadLinearAsset.
     tokens.push({ type: 'image', url: m[1] });
     lastIndex = re.lastIndex;
   }
-  const textAfter = content.slice(lastIndex).trim();
+  const textAfter = unwrapInlineMarkdownLinks(content.slice(lastIndex).trim());
   if (textAfter) tokens.push({ type: 'text', text: textAfter });
   return tokens;
 }
@@ -225,7 +235,13 @@ function parseHeaderFields(body, endIndex) {
  * sit after the last AC header it covers.
  */
 function parseACBlocks(body) {
-  const acHeaderRe = /^AC(\d+):\s*(.*)$/gm;
+  // QA sometimes wraps the AC label in markdown bold ("**AC18**:") and
+  // occasionally leaves a stray space before the colon ("**AC21** :"). Accept
+  // an optional leading/trailing ** (or __) and optional whitespace before
+  // the colon so those still count as a real AC header instead of being
+  // silently dropped (which previously produced zero ACs for a whole
+  // comment, with no error, if every header in it happened to be bolded).
+  const acHeaderRe = /^(?:\*\*|__)?AC(\d+)(?:\*\*|__)?\s*:\s*(.*)$/gm;
   const acHeaders = [];
   let m;
   while ((m = acHeaderRe.exec(body)) !== null) {
