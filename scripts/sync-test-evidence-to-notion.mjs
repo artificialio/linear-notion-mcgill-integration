@@ -846,9 +846,15 @@ async function main() {
     // dumping all the text first and all the screenshots after.
     for (const seg of ac.evidenceSegments) {
       if (seg.type === 'text') {
-        await appendBlocks(pageId, [
-          { object: 'block', type: 'paragraph', paragraph: { rich_text: [plainText(seg.text)] } },
-        ]);
+        // A QA tester's evidence is sometimes nothing but a pasted link (a
+        // Loom recording, say). unwrapInlineMarkdownLinks above already
+        // reduces that down to a bare URL, but plainText() alone would render
+        // it as inert text - make a whole-segment URL an actual clickable
+        // Notion link instead.
+        const trimmed = seg.text.trim();
+        const isBareUrl = /^https?:\/\/\S+$/.test(trimmed);
+        const richText = isBareUrl ? [linkText(trimmed, trimmed)] : [plainText(seg.text)];
+        await appendBlocks(pageId, [{ object: 'block', type: 'paragraph', paragraph: { rich_text: richText } }]);
         continue;
       }
       const url = seg.url;
